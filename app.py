@@ -1323,21 +1323,131 @@ def main():
                 label_visibility="collapsed", key="search_query"
             ).strip()
 
+            def _search_yahoo(query, max_results=8):
+                """
+                Search Yahoo Finance using their autocomplete/query API directly.
+                This endpoint is far less aggressively rate-limited than the
+                main data API and works reliably on cloud deployments.
+                Uses 3 fallback methods:
+                  1. Direct HTTP request to Yahoo autocomplete API
+                  2. yf.Search() via yfinance
+                  3. Returns empty list gracefully
+                """
+                import requests as _req, random as _rand, time as _time
+
+                UAS = [
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+                    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+                    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) "
+                    "Gecko/20100101 Firefox/125.0",
+                ]
+
+                # ── Method 1: Yahoo Finance autocomplete/quote search API
+                # This is what the Yahoo Finance website uses for its search bar.
+                # Much lighter endpoint, rarely blocked.
+                for attempt in range(3):
+                    try:
+                        url = "https://query1.finance.yahoo.com/v1/finance/search"
+                        params = {
+                            "q": query,
+                            "quotesCount": max_results,
+                            "newsCount": 0,
+                            "listsCount": 0,
+                            "enableFuzzyQuery": True,
+                            "quotesQueryId": "tss_match_phrase_query",
+                        }
+                        headers = {
+                            "User-Agent": _rand.choice(UAS),
+                            "Accept": "application/json",
+                            "Accept-Language": "en-US,en;q=0.9",
+                            "Referer": "https://finance.yahoo.com",
+                            "Origin": "https://finance.yahoo.com",
+                        }
+                        resp = _req.get(url, params=params, headers=headers, timeout=8)
+                        if resp.status_code == 200:
+                            data = resp.json()
+                            quotes = data.get("finance", {}).get("result", [{}])[0].get("quotes", [])
+                            results = []
+                            for q in quotes:
+                                sym  = q.get("symbol", "")
+                                name = q.get("shortname") or q.get("longname") or q.get("name", "")
+                                exch = q.get("exchange", "")
+                                qtype = q.get("quoteType", "")
+                                # Filter to equities and ETFs only
+                                if sym and name and qtype in ("EQUITY", "ETF", "MUTUALFUND", ""):
+                                    results.append({
+                                        "symbol":    sym,
+                                        "shortname": name,
+                                        "longname":  name,
+                                        "exchange":  exch,
+                                        "quoteType": qtype,
+                                    })
+                            if results:
+                                return results
+                        # Status not 200 or empty — try query2 endpoint
+                        url2 = url.replace("query1", "query2")
+                        resp2 = _req.get(url2, params=params, headers=headers, timeout=8)
+                        if resp2.status_code == 200:
+                            data2 = resp2.json()
+                            quotes2 = data2.get("finance", {}).get("result", [{}])[0].get("quotes", [])
+                            results2 = []
+                            for q in quotes2:
+                                sym  = q.get("symbol", "")
+                                name = q.get("shortname") or q.get("longname") or ""
+                                exch = q.get("exchange", "")
+                                qtype = q.get("quoteType", "")
+                                if sym and name:
+                                    results2.append({
+                                        "symbol":    sym,
+                                        "shortname": name,
+                                        "longname":  name,
+                                        "exchange":  exch,
+                                        "quoteType": qtype,
+                                    })
+                            if results2:
+                                return results2
+                        if attempt < 2:
+                            _time.sleep(1)
+                    except Exception:
+                        if attempt < 2:
+                            _time.sleep(1)
+
+                # ── Method 2: yf.Search() fallback
+                try:
+                    r = yf.Search(query, max_results=max_results)
+                    quotes = r.quotes if hasattr(r, "quotes") else []
+                    results = []
+                    for q in quotes:
+                        sym  = q.get("symbol", "")
+                        name = q.get("shortname") or q.get("longname") or ""
+                        if sym and name:  # fixed operator precedence bug
+                            results.append({
+                                "symbol":    sym,
+                                "shortname": name,
+                                "longname":  name,
+                                "exchange":  q.get("exchange", ""),
+                                "quoteType": q.get("quoteType", ""),
+                            })
+                    if results:
+                        return results
+                except Exception:
+                    pass
+
+                return []
+
             search_results = []
             if search_query and len(search_query) >= 2:
-                try:
-                    results = yf.Search(search_query, max_results=8)
-                    quotes  = results.quotes if hasattr(results, 'quotes') else []
-                    search_results = [
-                        q for q in quotes
-                        if q.get('symbol') and q.get('shortname') or q.get('longname')
-                    ]
-                except Exception:
-                    search_results = []
+                with st.spinner("Searching…"):
+                    search_results = _search_yahoo(search_query)
 
             if search_results:
                 options = {
-                    f"{q.get('shortname') or q.get('longname','Unknown')} [{q['symbol']}]  ·  {q.get('exchange','')}": q['symbol']
+                    f"{q.get('shortname') or q.get('longname','Unknown')} "
+                    f"[{q['symbol']}]  ·  {q.get('exchange','')}": q['symbol']
                     for q in search_results
                 }
                 chosen_label = st.selectbox(
@@ -1348,7 +1458,10 @@ def main():
                 st.caption(f"Ticker: **{ticker_input}**")
                 analyze_btn = st.button("⚡  Analyze", use_container_width=True, key="btn_search")
             elif search_query and len(search_query) >= 2:
-                st.caption("No results found — try a different name or switch to Ticker mode.")
+                st.caption(
+                    "No results found. Try a shorter name, "
+                    "or use 🔤 Ticker mode (e.g. TCS.NS, AAPL, RELIANCE.NS)."
+                )
 
         st.markdown('<div class="sidebar-section">Display</div>', unsafe_allow_html=True)
         show_dcf    = st.checkbox("DCF Analysis", True)
