@@ -671,55 +671,21 @@ def fetch_stock_data(ticker: str):
 
     def _make_session():
         """
-        Build the best available session in priority order.
-        curl_cffi impersonates Chrome at TLS level — most effective against
-        Yahoo Finance IP blocking on shared cloud servers like Streamlit Cloud.
+        Build the best available session.
+        Only curl_cffi sessions are compatible with yfinance >= 0.2.60.
+        requests or requests_cache sessions raise YFDataException in newer versions.
+        If curl_cffi not available, return None and let yfinance handle internally.
         """
-        # Priority 1: curl_cffi — browser-level impersonation
         try:
             from curl_cffi import requests as cffi_requests
+            # Use chrome120 impersonation — bypasses Yahoo IP blocking at TLS level
             session = cffi_requests.Session(impersonate="chrome120")
             return session, "curl_cffi"
         except ImportError:
             pass
-
-        # Priority 2: requests-cache — reduces repeat calls to Yahoo
-        try:
-            import requests_cache
-            session = requests_cache.CachedSession(
-                cache_name='/tmp/yfinance_cache',
-                expire_after=21600,   # match our Streamlit cache TTL
-                allowable_methods=['GET'],
-            )
-            USER_AGENTS = [
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
-                "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) "
-                "Gecko/20100101 Firefox/125.0",
-                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-            ]
-            session.headers.update({'User-Agent': random.choice(USER_AGENTS)})
-            return session, "requests_cache"
-        except ImportError:
-            pass
-
-        # Priority 3: plain requests with User-Agent
-        try:
-            import requests as req_plain
-            session = req_plain.Session()
-            session.headers.update({
-                'User-Agent': (
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-                )
-            })
-            return session, "requests"
         except Exception:
             pass
-
+        # No valid session — yfinance will use curl_cffi internally if installed
         return None, "none"
 
     def _fetch_info_with_retry(s, max_retries=4):
@@ -758,11 +724,22 @@ def fetch_stock_data(ticker: str):
             raise last_err
         return None
 
-    # ── Build session using best available library
+    # ── Build session
+    # IMPORTANT: yfinance >= 0.2.60 raises YFDataException if you pass
+    # a requests.Session or requests_cache.Session — it ONLY accepts
+    # curl_cffi sessions or no session at all (it uses curl_cffi internally).
+    # So: only inject session if it is curl_cffi, else let yfinance handle it.
     session, session_type = _make_session()
-    try:
-        s = yf.Ticker(ticker, session=session) if session else yf.Ticker(ticker)
-    except Exception:
+
+    if session_type == "curl_cffi":
+        # curl_cffi session — yfinance accepts this
+        try:
+            s = yf.Ticker(ticker, session=session)
+        except Exception:
+            s = yf.Ticker(ticker)
+    else:
+        # requests or requests_cache session — do NOT pass to yfinance >= 0.2.60
+        # yfinance will use curl_cffi internally if it is installed
         s = yf.Ticker(ticker)
 
     # ── Fetch info (most important, most frequently blocked)
