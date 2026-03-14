@@ -1325,13 +1325,10 @@ def main():
 
             def _search_yahoo(query, max_results=8):
                 """
-                Search Yahoo Finance using their autocomplete/query API directly.
-                This endpoint is far less aggressively rate-limited than the
-                main data API and works reliably on cloud deployments.
-                Uses 3 fallback methods:
-                  1. Direct HTTP request to Yahoo autocomplete API
-                  2. yf.Search() via yfinance
-                  3. Returns empty list gracefully
+                Search Yahoo Finance using 3 methods in order:
+                  1. Direct HTTP to Yahoo /v1/finance/search (query1 then query2)
+                  2. yf.Search() via yfinance internal session
+                  3. Empty list — user shown helpful message
                 """
                 import requests as _req, random as _rand, time as _time
 
@@ -1346,94 +1343,96 @@ def main():
                     "Gecko/20100101 Firefox/125.0",
                 ]
 
-                # ── Method 1: Yahoo Finance autocomplete/quote search API
-                # This is what the Yahoo Finance website uses for its search bar.
-                # Much lighter endpoint, rarely blocked.
-                for attempt in range(3):
+                VALID_TYPES = {"EQUITY", "ETF", "MUTUALFUND", "CURRENCY",
+                               "equity", "etf", "mutualfund", ""}
+
+                def _parse_quotes(raw_json):
+                    """
+                    Safely parse Yahoo search JSON into a clean results list.
+                    Handles:
+                     - Empty result list (no IndexError)
+                     - quoteType in any case
+                     - Missing shortname/longname
+                    """
                     try:
-                        url = "https://query1.finance.yahoo.com/v1/finance/search"
-                        params = {
-                            "q": query,
-                            "quotesCount": max_results,
-                            "newsCount": 0,
-                            "listsCount": 0,
-                            "enableFuzzyQuery": True,
-                            "quotesQueryId": "tss_match_phrase_query",
-                        }
-                        headers = {
-                            "User-Agent": _rand.choice(UAS),
-                            "Accept": "application/json",
-                            "Accept-Language": "en-US,en;q=0.9",
-                            "Referer": "https://finance.yahoo.com",
-                            "Origin": "https://finance.yahoo.com",
-                        }
-                        resp = _req.get(url, params=params, headers=headers, timeout=8)
-                        if resp.status_code == 200:
-                            data = resp.json()
-                            quotes = data.get("finance", {}).get("result", [{}])[0].get("quotes", [])
-                            results = []
-                            for q in quotes:
-                                sym  = q.get("symbol", "")
-                                name = q.get("shortname") or q.get("longname") or q.get("name", "")
-                                exch = q.get("exchange", "")
-                                qtype = q.get("quoteType", "")
-                                # Filter to equities and ETFs only
-                                if sym and name and qtype in ("EQUITY", "ETF", "MUTUALFUND", ""):
-                                    results.append({
-                                        "symbol":    sym,
-                                        "shortname": name,
-                                        "longname":  name,
-                                        "exchange":  exch,
-                                        "quoteType": qtype,
-                                    })
-                            if results:
-                                return results
-                        # Status not 200 or empty — try query2 endpoint
-                        url2 = url.replace("query1", "query2")
-                        resp2 = _req.get(url2, params=params, headers=headers, timeout=8)
-                        if resp2.status_code == 200:
-                            data2 = resp2.json()
-                            quotes2 = data2.get("finance", {}).get("result", [{}])[0].get("quotes", [])
-                            results2 = []
-                            for q in quotes2:
-                                sym  = q.get("symbol", "")
-                                name = q.get("shortname") or q.get("longname") or ""
-                                exch = q.get("exchange", "")
-                                qtype = q.get("quoteType", "")
-                                if sym and name:
-                                    results2.append({
-                                        "symbol":    sym,
-                                        "shortname": name,
-                                        "longname":  name,
-                                        "exchange":  exch,
-                                        "quoteType": qtype,
-                                    })
-                            if results2:
-                                return results2
-                        if attempt < 2:
-                            _time.sleep(1)
+                        result_list = raw_json.get("finance", {}).get("result", [])
+                        if not result_list:           # ← fixes IndexError crash
+                            return []
+                        quotes = result_list[0].get("quotes", [])
+                        out = []
+                        for q in quotes:
+                            sym   = (q.get("symbol") or "").strip()
+                            name  = (q.get("shortname") or
+                                     q.get("longname") or
+                                     q.get("name") or "").strip()
+                            exch  = q.get("exchange", "")
+                            qtype = q.get("quoteType", "")
+                            # Accept any quote type — don't over-filter
+                            # Users searching "HDFC Bank" should see banking stocks
+                            if sym and name:
+                                out.append({
+                                    "symbol":    sym,
+                                    "shortname": name,
+                                    "longname":  name,
+                                    "exchange":  exch,
+                                    "quoteType": qtype,
+                                })
+                        return out
                     except Exception:
-                        if attempt < 2:
-                            _time.sleep(1)
+                        return []
+
+                params = {
+                    "q":             query,
+                    "quotesCount":   max_results,
+                    "newsCount":     0,
+                    "listsCount":    0,
+                    "enableFuzzyQuery": True,
+                    "quotesQueryId": "tss_match_phrase_query",
+                }
+                headers = {
+                    "User-Agent":      _rand.choice(UAS),
+                    "Accept":          "application/json",
+                    "Accept-Language": "en-US,en;q=0.9",
+                    "Referer":         "https://finance.yahoo.com",
+                    "Origin":          "https://finance.yahoo.com",
+                }
+
+                # ── Method 1: Direct HTTP calls to Yahoo search API
+                for base in ["https://query1.finance.yahoo.com/v1/finance/search",
+                             "https://query2.finance.yahoo.com/v1/finance/search"]:
+                    for attempt in range(2):
+                        try:
+                            resp = _req.get(base, params=params,
+                                            headers=headers, timeout=8)
+                            if resp.status_code == 200:
+                                parsed = _parse_quotes(resp.json())
+                                if parsed:
+                                    return parsed
+                            if attempt == 0:
+                                _time.sleep(0.5)
+                        except Exception:
+                            if attempt == 0:
+                                _time.sleep(0.5)
 
                 # ── Method 2: yf.Search() fallback
                 try:
                     r = yf.Search(query, max_results=max_results)
                     quotes = r.quotes if hasattr(r, "quotes") else []
-                    results = []
+                    out = []
                     for q in quotes:
-                        sym  = q.get("symbol", "")
-                        name = q.get("shortname") or q.get("longname") or ""
-                        if sym and name:  # fixed operator precedence bug
-                            results.append({
+                        sym  = (q.get("symbol") or "").strip()
+                        name = (q.get("shortname") or
+                                q.get("longname") or "").strip()
+                        if sym and name:
+                            out.append({
                                 "symbol":    sym,
                                 "shortname": name,
                                 "longname":  name,
                                 "exchange":  q.get("exchange", ""),
                                 "quoteType": q.get("quoteType", ""),
                             })
-                    if results:
-                        return results
+                    if out:
+                        return out
                 except Exception:
                     pass
 
