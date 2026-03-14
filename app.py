@@ -1953,19 +1953,28 @@ def main():
     st.markdown("---")
 
     # ── Stats engine: Supabase (cloud) with JSON fallback (local)
+    # Entire block wrapped — stats failure must NEVER crash the app
     import json, os
 
     # ── Detect if Supabase secrets are available
     def _get_supabase():
-        """Returns supabase client if secrets configured, else None."""
+        """Returns supabase client if secrets configured, else None.
+        Uses key-based access instead of .get() — more reliable across
+        all Streamlit versions and avoids AttributeError on st.secrets.
+        """
         try:
-            url = st.secrets.get("SUPABASE_URL", "")
-            key = st.secrets.get("SUPABASE_KEY", "")
+            # Access secrets via key lookup — raises KeyError if missing
+            url = st.secrets["SUPABASE_URL"]
+            key = st.secrets["SUPABASE_KEY"]
             if not url or not key:
                 return None
             from supabase import create_client
-            return create_client(url, key)
+            return create_client(str(url), str(key))
+        except KeyError:
+            # Secrets not configured — running locally without secrets
+            return None
         except Exception:
+            # Any other error (import fail, network, etc.) — degrade gracefully
             return None
 
     # ── Supabase stats functions
@@ -2009,7 +2018,13 @@ def main():
             pass
 
     # ── Local JSON fallback (for running on your own machine)
-    STATS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.hfactor_stats.json')
+    # Safe path for local stats file — works on both local and cloud
+    # Falls back to current working directory if __file__ is unavailable
+    try:
+        _base_dir = os.path.dirname(os.path.abspath(__file__))
+    except (NameError, OSError):
+        _base_dir = os.getcwd()
+    STATS_FILE = os.path.join(_base_dir, '.hfactor_stats.json')
 
     def _local_load():
         try:
@@ -2031,7 +2046,10 @@ def main():
         _local_save(d)
 
     # ── Unified interface — auto-selects backend
-    _sb = _get_supabase()
+    try:
+        _sb = _get_supabase()
+    except Exception:
+        _sb = None
     _using_supabase = _sb is not None
 
     def load_stats():
@@ -2046,21 +2064,27 @@ def main():
             _local_increment(field)
 
     # ── Count visit once per browser session
-    if "visit_counted" not in st.session_state:
-        st.session_state["visit_counted"] = True
-        increment_stat("visits")
-
-    stats  = load_stats()
-    visits = stats.get("visits", 0)
-    hearts = stats.get("hearts", 0)
+    try:
+        if "visit_counted" not in st.session_state:
+            st.session_state["visit_counted"] = True
+            increment_stat("visits")
+        stats  = load_stats()
+        visits = stats.get("visits", 0)
+        hearts = stats.get("hearts", 0)
+    except Exception:
+        visits = 0
+        hearts = 0
 
     # ── Log this analysis event (once per ticker per session)
-    if _using_supabase:
-        log_key = f"logged_{ticker}"
-        if log_key not in st.session_state:
-            st.session_state[log_key] = True
-            _supabase_log(_sb, ticker, currency_code, verdict,
-                          info.get("country", "Unknown"))
+    try:
+        if _using_supabase and _sb is not None:
+            log_key = f"logged_{ticker}"
+            if log_key not in st.session_state:
+                st.session_state[log_key] = True
+                _supabase_log(_sb, ticker, currency_code, verdict,
+                              info.get("country", "Unknown"))
+    except Exception:
+        pass
 
     # ── Heart reaction (once per session)
     if "user_hearted" not in st.session_state:
@@ -2073,9 +2097,12 @@ def main():
         if st.button(heart_label, key="heart_btn", use_container_width=True):
             if not st.session_state["user_hearted"]:
                 st.session_state["user_hearted"] = True
-                increment_stat("hearts")
-                stats  = load_stats()
-                hearts = stats.get("hearts", 0)
+                try:
+                    increment_stat("hearts")
+                    stats  = load_stats()
+                    hearts = stats.get("hearts", 0)
+                except Exception:
+                    pass
                 st.rerun()
 
     with footer_left:
