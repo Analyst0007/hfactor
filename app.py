@@ -2226,24 +2226,46 @@ def main():
 
     # ── Detect if Supabase secrets are available
     def _get_supabase():
-        """Returns supabase client if secrets configured, else None.
-        Uses key-based access instead of .get() — more reliable across
-        all Streamlit versions and avoids AttributeError on st.secrets.
         """
+        Returns Supabase client if credentials are available, else None.
+
+        Reads credentials from TWO sources in priority order:
+
+        1. st.secrets  — used by Streamlit Cloud (secrets panel)
+                         and local .streamlit/secrets.toml
+        2. os.environ  — used by Render, Railway, Oracle VPS,
+                         Docker, and any other hosting platform
+                         where you set environment variables
+
+        This makes the app work on ALL deployment platforms automatically.
+        """
+        url, key = None, None
+
+        # ── Source 1: Streamlit secrets (Streamlit Cloud / local secrets.toml)
         try:
-            # Access secrets via key lookup — raises KeyError if missing
             url = st.secrets["SUPABASE_URL"]
             key = st.secrets["SUPABASE_KEY"]
-            if not url or not key:
-                return None
-            from supabase import create_client
-            return create_client(str(url), str(key))
-        except KeyError:
-            # Secrets not configured — running locally without secrets
-            return None
         except Exception:
-            # Any other error (import fail, network, etc.) — degrade gracefully
-            return None
+            pass  # Not on Streamlit Cloud or no secrets.toml
+
+        # ── Source 2: OS environment variables (Render, Railway, VPS etc.)
+        if not url or not key:
+            import os as _os
+            url = _os.environ.get("SUPABASE_URL", "")
+            key = _os.environ.get("SUPABASE_KEY", "")
+
+        # ── Validate and connect
+        if not url or not key:
+            return None  # No credentials found anywhere — running bare locally
+
+        try:
+            from supabase import create_client
+            client = create_client(str(url).strip(), str(key).strip())
+            return client
+        except ImportError:
+            return None  # supabase package not installed
+        except Exception:
+            return None  # Connection failed — degrade gracefully
 
     # ── Supabase stats functions
     def _supabase_load(client):
