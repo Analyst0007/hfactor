@@ -636,17 +636,68 @@ st.markdown(THEME, unsafe_allow_html=True)
 # ═══════════════════════════════════════════════════════════════
 # DATA LAYER
 # ═══════════════════════════════════════════════════════════════
-@st.cache_data(ttl=21600, show_spinner=False)  # 6 hours — reduces Yahoo Finance calls
+@st.cache_data(ttl=21600, show_spinner=False)  # 6 hours cache
 def fetch_stock_data(ticker: str):
     """
-    Fetch all stock data with retry + exponential backoff.
-    Handles Yahoo Finance rate limiting (429 Too Many Requests).
-    TTL = 6 hours so cached data is reused across sessions.
+    Fetch all stock data with:
+    1. Random User-Agent rotation (avoids bot detection by Yahoo)
+    2. Empty-response detection + retry (Yahoo silently returns {} when blocking)
+    3. Exponential backoff on both exceptions AND empty responses
+    4. fast_info fallback for basic price data if .info fails
     """
-    import time
+    import time, random
+
+    # Rotate User-Agents to appear as real browser traffic
+    USER_AGENTS = [
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) "
+        "Gecko/20100101 Firefox/121.0",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Safari/605.1.15",
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    ]
+
+    def _is_valid_info(d):
+        """Check info dict has meaningful data — Yahoo returns {} when blocking."""
+        if not d or not isinstance(d, dict):
+            return False
+        # Must have at least one price field to be considered valid
+        return any(k in d for k in [
+            'currentPrice', 'regularMarketPrice', 'previousClose',
+            'open', 'bid', 'ask', 'marketCap', 'trailingPE'
+        ])
+
+    def _fetch_info_with_retry(s, max_retries=4):
+        """
+        Fetch .info with retry on both exceptions AND empty responses.
+        Yahoo Finance silently returns {} when rate limiting — this detects that.
+        """
+        for attempt in range(max_retries):
+            try:
+                data = s.info
+                if _is_valid_info(data):
+                    return data
+                # Got empty dict — Yahoo is blocking, wait and retry
+                wait = 3 * (2 ** attempt)   # 3s, 6s, 12s, 24s
+                time.sleep(wait)
+            except Exception as e:
+                err_str = str(e).lower()
+                if any(k in err_str for k in [
+                    '429', 'rate', 'too many', 'connection',
+                    'timeout', 'remote', 'chunked', 'proxy'
+                ]):
+                    wait = 3 * (2 ** attempt)
+                    time.sleep(wait)
+                else:
+                    raise e
+        return {}   # Return empty after all retries exhausted
 
     def _fetch_with_retry(fn, max_retries=3, base_delay=2):
-        """Call fn() with exponential backoff on failure."""
+        """Generic retry for non-info fetches (history, financials etc)."""
         last_err = None
         for attempt in range(max_retries):
             try:
@@ -654,27 +705,58 @@ def fetch_stock_data(ticker: str):
             except Exception as e:
                 last_err = e
                 err_str = str(e).lower()
-                # Rate limit or connection error — wait and retry
-                if any(k in err_str for k in ['429', 'rate', 'too many', 'connection',
-                                               'timeout', 'remote', 'chunked']):
-                    wait = base_delay * (2 ** attempt)   # 2s, 4s, 8s
-                    time.sleep(wait)
+                if any(k in err_str for k in [
+                    '429', 'rate', 'too many', 'connection',
+                    'timeout', 'remote', 'chunked', 'proxy'
+                ]):
+                    time.sleep(base_delay * (2 ** attempt))
                 else:
-                    raise e   # Non-retryable error — raise immediately
-        raise last_err
+                    raise e
+        if last_err:
+            raise last_err
+        return None
 
-    s = yf.Ticker(ticker)
+    # Set random User-Agent on yfinance session to rotate identity
+    try:
+        import requests
+        session = requests.Session()
+        session.headers.update({'User-Agent': random.choice(USER_AGENTS)})
+        s = yf.Ticker(ticker, session=session)
+    except Exception:
+        s = yf.Ticker(ticker)   # fallback to default if session fails
 
-    # Add small stagger between each API call to avoid burst limiting
-    info         = _fetch_with_retry(lambda: s.info)
-    time.sleep(0.3)
-    hist         = _fetch_with_retry(lambda: s.history(period="2y"))
-    time.sleep(0.3)
-    financials   = _fetch_with_retry(lambda: s.financials)
-    time.sleep(0.3)
+    # ── Fetch info (most important, most frequently blocked)
+    info = _fetch_info_with_retry(s)
+
+    # ── If info still empty, try fast_info as partial fallback
+    if not _is_valid_info(info):
+        try:
+            fi = s.fast_info
+            # Build minimal info dict from fast_info attributes
+            info = {
+                'currentPrice':      getattr(fi, 'last_price', None),
+                'regularMarketPrice':getattr(fi, 'last_price', None),
+                'marketCap':         getattr(fi, 'market_cap', None),
+                'currency':          getattr(fi, 'currency', 'USD'),
+                'exchange':          getattr(fi, 'exchange', None),
+                'fiftyTwoWeekHigh':  getattr(fi, 'year_high', None),
+                'fiftyTwoWeekLow':   getattr(fi, 'year_low', None),
+                'previousClose':     getattr(fi, 'previous_close', None),
+            }
+            # Remove None values
+            info = {k: v for k, v in info.items() if v is not None}
+        except Exception:
+            info = {}
+
+    # ── Fetch remaining data with stagger
+    time.sleep(0.5)
+    hist          = _fetch_with_retry(lambda: s.history(period="2y"))
+    time.sleep(0.5)
+    financials    = _fetch_with_retry(lambda: s.financials)
+    time.sleep(0.5)
     balance_sheet = _fetch_with_retry(lambda: s.balance_sheet)
-    time.sleep(0.3)
-    cashflow     = _fetch_with_retry(lambda: s.cashflow)
+    time.sleep(0.5)
+    cashflow      = _fetch_with_retry(lambda: s.cashflow)
 
     return info, hist, financials, balance_sheet, cashflow
 
@@ -1442,9 +1524,27 @@ def main():
             return
 
     # ── Validate info before any .get() calls
-    if not info or not isinstance(info, dict):
-        st.error(f"No data found for **{ticker}**. Yahoo Finance returned no data. "
-                 f"Check the ticker symbol (e.g. RELIANCE.NS for NSE, RELIANCE.BO for BSE).")
+    if not info or not isinstance(info, dict) or not any(
+        k in info for k in ['currentPrice','regularMarketPrice','previousClose','marketCap']
+    ):
+        st.error(
+            f"⚠️ Could not load data for **{ticker}**. "
+            f"Yahoo Finance may be temporarily blocking requests from this server. "
+            f"This usually resolves on its own."
+        )
+        st.info(
+            '💡 **What to try:**\n'
+            '- Wait 2-3 minutes and click Analyze again\n'
+            '- The data is cached for 6 hours once loaded successfully\n'
+            '- If this persists, try analyzing a different stock first, '
+            'then come back to this one'
+        )
+        st.warning(
+            f"If you believe **{ticker}** is a valid ticker, "
+            f"this is a Yahoo Finance server-side block — not a ticker error. "
+            f"TCS.NS, RELIANCE.NS, HDFCBANK.NS are all valid examples that "
+            f"may temporarily fail on shared cloud servers."
+        )
         return
 
     cp = safe_get(info, 'currentPrice') or safe_get(info, 'regularMarketPrice')
