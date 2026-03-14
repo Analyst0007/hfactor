@@ -684,9 +684,13 @@ def fetch_stock_data(ticker: str):
 # ═══════════════════════════════════════════════════════════════
 def safe_get(d, k, default=None):
     """Safely extract a value from a dict.
-    Returns default for None, N/A, inf, NaN.
+    Returns default for None dict, None value, N/A, inf, NaN.
     Does NOT filter 0.0 — zero is a valid financial value.
     """
+    if d is None:                        # ← guard: dict itself is None
+        return default
+    if not isinstance(d, dict):          # ← guard: not even a dict
+        return default
     v = d.get(k, default)
     if v is None or v == "N/A":
         return default
@@ -720,6 +724,8 @@ CURRENCY_SYMBOLS = {
 }
 
 def get_currency(info):
+    if not info or not isinstance(info, dict):
+        return 'USD', '$'
     code = (info.get('currency') or 'USD').upper()
     return code, CURRENCY_SYMBOLS.get(code, f"{code} ")
 
@@ -794,6 +800,8 @@ def upside_color(u):
 # METRICS
 # ═══════════════════════════════════════════════════════════════
 def calculate_metrics(info, cashflow):
+    if info is None or not isinstance(info, dict):
+        info = {}   # use empty dict so safe_get returns defaults
     m = {}
     keys = [
         ('pe','trailingPE'),('forward_pe','forwardPE'),('pb','priceToBook'),
@@ -1433,9 +1441,16 @@ def main():
                 st.error(f"Data fetch failed: {e}")
             return
 
-    cp = safe_get(info,'currentPrice') or safe_get(info,'regularMarketPrice')
-    if not info or not cp:
-        st.error(f"No data found for **{ticker}**. Check the ticker symbol and try again.")
+    # ── Validate info before any .get() calls
+    if not info or not isinstance(info, dict):
+        st.error(f"No data found for **{ticker}**. Yahoo Finance returned no data. "
+                 f"Check the ticker symbol (e.g. RELIANCE.NS for NSE, RELIANCE.BO for BSE).")
+        return
+
+    cp = safe_get(info, 'currentPrice') or safe_get(info, 'regularMarketPrice')
+    if not cp:
+        st.error(f"Could not get current price for **{ticker}**. "
+                 f"The market may be closed or the ticker may be delisted.")
         return
 
     currency_code, SYM = get_currency(info)
@@ -1471,11 +1486,12 @@ def main():
     verdict, confidence = get_verdict(scores, dcf, m)
     targets = calc_targets(info, m, dcf)
 
-    company  = info.get('longName', ticker)
-    sector   = info.get('sector', 'Unknown')
-    industry = info.get('industry', 'Unknown')
-    country  = info.get('country', '')
-    mktcap   = safe_get(info,'marketCap')
+    _i       = info if (info and isinstance(info, dict)) else {}
+    company  = _i.get('longName', ticker)
+    sector   = _i.get('sector', 'Unknown')
+    industry = _i.get('industry', 'Unknown')
+    country  = _i.get('country', '')
+    mktcap   = safe_get(info, 'marketCap')
     wk52_h   = m.get('52w_high')
     wk52_l   = m.get('52w_low')
     pct_from_high = ((cp - wk52_h) / wk52_h * 100) if wk52_h else None
@@ -1911,10 +1927,10 @@ def main():
 
     # ── TAB 5: OVERVIEW ─────────────────────────────────────
     with tab5:
-        summary = info.get('longBusinessSummary','')
+        _info = info if (info and isinstance(info, dict)) else {}
+        summary = _info.get('longBusinessSummary','')
         if summary:
             section("Company Overview", "🏢")
-            # Render in a styled box with justified, readable text
             st.markdown(f'''
             <div class="company-overview-box">
                 <div class="overview-text">{summary}</div>
@@ -1923,30 +1939,25 @@ def main():
         section("Key Information", "📋")
         left, right = st.columns(2)
 
-        # Fiscal year — human readable (Change 2)
-        raw_fy  = info.get('mostRecentQuarter') or info.get('lastFiscalYearEnd')
-        fy_str  = fmt_fiscal_year(raw_fy)
-
-        # Website — cleaned (Change 2)
-        website_str = fmt_website(info.get('website'))
-
-        # Employee count
-        emp = info.get('fullTimeEmployees')
-        emp_str = f"{emp:,}" if emp else '—'
+        raw_fy      = _info.get('mostRecentQuarter') or _info.get('lastFiscalYearEnd')
+        fy_str      = fmt_fiscal_year(raw_fy)
+        website_str = fmt_website(_info.get('website'))
+        emp         = _info.get('fullTimeEmployees')
+        emp_str     = f"{emp:,}" if emp else '—'
 
         with left:
             mc_row([
-                ("Exchange",    info.get('exchange','—'),  None),
-                ("Country",     info.get('country','—'),   None),
-                ("Currency",    currency_code,               'blue'),
-                ("Employees",   emp_str,                     None),
+                ("Exchange",    _info.get('exchange','—'),  None),
+                ("Country",     _info.get('country','—'),   None),
+                ("Currency",    currency_code,                'blue'),
+                ("Employees",   emp_str,                      None),
             ])
         with right:
             mc_row([
-                ("Website",        website_str,              None),
-                ("IPO Date",       info.get('ipoExpectedDate','—'), None),
-                ("Most Recent Quarter", fy_str,              'amber'),
-                ("Sector",         info.get('sector','—'), None),
+                ("Website",             website_str,                     None),
+                ("IPO Date",            _info.get('ipoExpectedDate','—'), None),
+                ("Most Recent Quarter", fy_str,                          'amber'),
+                ("Sector",              _info.get('sector','—'),         None),
             ])
 
     # ── FOOTER ──────────────────────────────────────────────
