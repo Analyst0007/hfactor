@@ -636,10 +636,47 @@ st.markdown(THEME, unsafe_allow_html=True)
 # ═══════════════════════════════════════════════════════════════
 # DATA LAYER
 # ═══════════════════════════════════════════════════════════════
-@st.cache_data(ttl=3600, show_spinner=False)
+@st.cache_data(ttl=21600, show_spinner=False)  # 6 hours — reduces Yahoo Finance calls
 def fetch_stock_data(ticker: str):
+    """
+    Fetch all stock data with retry + exponential backoff.
+    Handles Yahoo Finance rate limiting (429 Too Many Requests).
+    TTL = 6 hours so cached data is reused across sessions.
+    """
+    import time
+
+    def _fetch_with_retry(fn, max_retries=3, base_delay=2):
+        """Call fn() with exponential backoff on failure."""
+        last_err = None
+        for attempt in range(max_retries):
+            try:
+                return fn()
+            except Exception as e:
+                last_err = e
+                err_str = str(e).lower()
+                # Rate limit or connection error — wait and retry
+                if any(k in err_str for k in ['429', 'rate', 'too many', 'connection',
+                                               'timeout', 'remote', 'chunked']):
+                    wait = base_delay * (2 ** attempt)   # 2s, 4s, 8s
+                    time.sleep(wait)
+                else:
+                    raise e   # Non-retryable error — raise immediately
+        raise last_err
+
     s = yf.Ticker(ticker)
-    return s.info, s.history(period="2y"), s.financials, s.balance_sheet, s.cashflow
+
+    # Add small stagger between each API call to avoid burst limiting
+    info         = _fetch_with_retry(lambda: s.info)
+    time.sleep(0.3)
+    hist         = _fetch_with_retry(lambda: s.history(period="2y"))
+    time.sleep(0.3)
+    financials   = _fetch_with_retry(lambda: s.financials)
+    time.sleep(0.3)
+    balance_sheet = _fetch_with_retry(lambda: s.balance_sheet)
+    time.sleep(0.3)
+    cashflow     = _fetch_with_retry(lambda: s.cashflow)
+
+    return info, hist, financials, balance_sheet, cashflow
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -1366,16 +1403,34 @@ def main():
 
     if analyze_btn:
         st.session_state['ticker'] = ticker_input
-        fetch_stock_data.clear()
+        # Only clear cache if it's a different ticker than last time
+        # Avoids unnecessary Yahoo Finance API calls for same ticker
+        if st.session_state.get('last_fetched') != ticker_input:
+            fetch_stock_data.clear()
+            st.session_state['last_fetched'] = ticker_input
 
     ticker = st.session_state.get('ticker', ticker_input)
 
     # ── FETCH ────────────────────────────────────────────────
-    with st.spinner(f"Fetching data for {ticker}…"):
+    with st.spinner(f"Fetching data for {ticker}… (retrying if rate limited)"):
         try:
             info, hist, financials, balance_sheet, cashflow = fetch_stock_data(ticker)
         except Exception as e:
-            st.error(f"Data fetch failed: {e}")
+            err_str = str(e).lower()
+            if any(k in err_str for k in ['429', 'rate', 'too many']):
+                st.error(
+                    "⚠️ Yahoo Finance is rate limiting requests right now. "
+                    "This is temporary and usually resolves in 1–2 minutes. "
+                    "Please wait a moment and try again."
+                )
+                st.info(
+                    "💡 **Tips to reduce rate limiting:**\n"
+                    "- Wait 60–90 seconds before retrying\n"
+                    "- Avoid analyzing many different stocks in quick succession\n"
+                    "- The same stock won't trigger this — it's cached for 6 hours"
+                )
+            else:
+                st.error(f"Data fetch failed: {e}")
             return
 
     cp = safe_get(info,'currentPrice') or safe_get(info,'regularMarketPrice')
@@ -1774,8 +1829,17 @@ def main():
             chosen = st.select_slider("Period", list(period_opts.keys()), "2 Years")
             p = period_opts[chosen]
 
-            @st.cache_data(ttl=3600, show_spinner=False)
-            def get_hist(t, per): return yf.Ticker(t).history(period=per)
+            @st.cache_data(ttl=21600, show_spinner=False)
+            def get_hist(t, per):
+                import time
+                for attempt in range(3):
+                    try:
+                        return yf.Ticker(t).history(period=per)
+                    except Exception as e:
+                        if attempt < 2:
+                            time.sleep(2 * (2 ** attempt))
+                        else:
+                            raise e
             h = get_hist(ticker, p)
 
             fig = make_subplots(rows=2, cols=1, shared_xaxes=True,
