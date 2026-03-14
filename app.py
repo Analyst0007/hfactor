@@ -639,76 +639,118 @@ st.markdown(THEME, unsafe_allow_html=True)
 @st.cache_data(ttl=21600, show_spinner=False)  # 6 hours cache
 def fetch_stock_data(ticker: str):
     """
-    Fetch all stock data with:
-    1. Random User-Agent rotation (avoids bot detection by Yahoo)
-    2. Empty-response detection + retry (Yahoo silently returns {} when blocking)
-    3. Exponential backoff on both exceptions AND empty responses
-    4. fast_info fallback for basic price data if .info fails
+    Fetch all stock data using a 3-layer session strategy:
+
+    Layer A — curl_cffi (BEST): impersonates Chrome at HTTP/2 + TLS fingerprint
+              level. Yahoo Finance cannot distinguish this from a real browser.
+              This is the official yfinance recommendation for cloud deployments.
+
+    Layer B — requests-cache: standard requests with disk cache + User-Agent
+              rotation. Reduces repeat calls, works when curl_cffi unavailable.
+
+    Layer C — plain yf.Ticker: bare fallback with no session customisation.
+
+    Plus: empty-response detection (Yahoo returns {} silently when blocking),
+    exponential backoff, fast_info + Search fallbacks for partial data.
     """
     import time, random
 
-    # Rotate User-Agents to appear as real browser traffic
-    USER_AGENTS = [
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) "
-        "Gecko/20100101 Firefox/121.0",
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-        "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Safari/605.1.15",
-        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    RATE_LIMIT_KEYS = [
+        '429', 'rate', 'too many', 'connection',
+        'timeout', 'remote', 'chunked', 'proxy', 'forbidden', '403'
     ]
 
     def _is_valid_info(d):
-        """Check info dict has meaningful data — Yahoo returns {} when blocking."""
+        """Yahoo returns empty {} when blocking — detect it."""
         if not d or not isinstance(d, dict):
             return False
-        # Must have at least one price field to be considered valid
         return any(k in d for k in [
             'currentPrice', 'regularMarketPrice', 'previousClose',
             'open', 'bid', 'ask', 'marketCap', 'trailingPE'
         ])
 
+    def _make_session():
+        """
+        Build the best available session in priority order.
+        curl_cffi impersonates Chrome at TLS level — most effective against
+        Yahoo Finance IP blocking on shared cloud servers like Streamlit Cloud.
+        """
+        # Priority 1: curl_cffi — browser-level impersonation
+        try:
+            from curl_cffi import requests as cffi_requests
+            session = cffi_requests.Session(impersonate="chrome120")
+            return session, "curl_cffi"
+        except ImportError:
+            pass
+
+        # Priority 2: requests-cache — reduces repeat calls to Yahoo
+        try:
+            import requests_cache
+            session = requests_cache.CachedSession(
+                cache_name='/tmp/yfinance_cache',
+                expire_after=21600,   # match our Streamlit cache TTL
+                allowable_methods=['GET'],
+            )
+            USER_AGENTS = [
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) "
+                "Gecko/20100101 Firefox/125.0",
+                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            ]
+            session.headers.update({'User-Agent': random.choice(USER_AGENTS)})
+            return session, "requests_cache"
+        except ImportError:
+            pass
+
+        # Priority 3: plain requests with User-Agent
+        try:
+            import requests as req_plain
+            session = req_plain.Session()
+            session.headers.update({
+                'User-Agent': (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+                )
+            })
+            return session, "requests"
+        except Exception:
+            pass
+
+        return None, "none"
+
     def _fetch_info_with_retry(s, max_retries=4):
         """
-        Fetch .info with retry on both exceptions AND empty responses.
-        Yahoo Finance silently returns {} when rate limiting — this detects that.
+        Retry on both exceptions AND empty responses.
+        Yahoo returns {} silently when blocking — _is_valid_info detects this.
         """
         for attempt in range(max_retries):
             try:
                 data = s.info
                 if _is_valid_info(data):
                     return data
-                # Got empty dict — Yahoo is blocking, wait and retry
-                wait = 3 * (2 ** attempt)   # 3s, 6s, 12s, 24s
+                wait = 3 * (2 ** attempt)   # 3s → 6s → 12s → 24s
                 time.sleep(wait)
             except Exception as e:
                 err_str = str(e).lower()
-                if any(k in err_str for k in [
-                    '429', 'rate', 'too many', 'connection',
-                    'timeout', 'remote', 'chunked', 'proxy'
-                ]):
-                    wait = 3 * (2 ** attempt)
-                    time.sleep(wait)
+                if any(k in err_str for k in RATE_LIMIT_KEYS):
+                    time.sleep(3 * (2 ** attempt))
                 else:
                     raise e
-        return {}   # Return empty after all retries exhausted
+        return {}
 
     def _fetch_with_retry(fn, max_retries=3, base_delay=2):
-        """Generic retry for non-info fetches (history, financials etc)."""
+        """Generic retry for history, financials, cashflow etc."""
         last_err = None
         for attempt in range(max_retries):
             try:
                 return fn()
             except Exception as e:
                 last_err = e
-                err_str = str(e).lower()
-                if any(k in err_str for k in [
-                    '429', 'rate', 'too many', 'connection',
-                    'timeout', 'remote', 'chunked', 'proxy'
-                ]):
+                if any(k in str(e).lower() for k in RATE_LIMIT_KEYS):
                     time.sleep(base_delay * (2 ** attempt))
                 else:
                     raise e
@@ -716,24 +758,24 @@ def fetch_stock_data(ticker: str):
             raise last_err
         return None
 
-    # Set random User-Agent on yfinance session to rotate identity
+    # ── Build session using best available library
+    session, session_type = _make_session()
     try:
-        import requests
-        session = requests.Session()
-        session.headers.update({'User-Agent': random.choice(USER_AGENTS)})
-        s = yf.Ticker(ticker, session=session)
+        s = yf.Ticker(ticker, session=session) if session else yf.Ticker(ticker)
     except Exception:
-        s = yf.Ticker(ticker)   # fallback to default if session fails
+        s = yf.Ticker(ticker)
 
     # ── Fetch info (most important, most frequently blocked)
     info = _fetch_info_with_retry(s)
 
-    # ── If info still empty, try fast_info as partial fallback
+    # ── If info still empty, try fast_info + Search as fallback
     if not _is_valid_info(info):
+        fallback = {}
+
+        # Layer 1: fast_info — different endpoint, often works when .info blocked
         try:
             fi = s.fast_info
-            # Build minimal info dict from fast_info attributes
-            info = {
+            fallback.update({
                 'currentPrice':      getattr(fi, 'last_price', None),
                 'regularMarketPrice':getattr(fi, 'last_price', None),
                 'marketCap':         getattr(fi, 'market_cap', None),
@@ -742,11 +784,35 @@ def fetch_stock_data(ticker: str):
                 'fiftyTwoWeekHigh':  getattr(fi, 'year_high', None),
                 'fiftyTwoWeekLow':   getattr(fi, 'year_low', None),
                 'previousClose':     getattr(fi, 'previous_close', None),
-            }
-            # Remove None values
-            info = {k: v for k, v in info.items() if v is not None}
+            })
         except Exception:
-            info = {}
+            pass
+
+        # Layer 2: yf.Search — fetches company metadata from a different endpoint
+        # This gives us longName, sector, industry, exchange even when .info blocked
+        try:
+            search_result = yf.Search(ticker, max_results=1)
+            quotes = search_result.quotes if hasattr(search_result, 'quotes') else []
+            if quotes:
+                q = quotes[0]
+                # Only fill fields not already in fallback
+                if not fallback.get('longName'):
+                    fallback['longName']  = q.get('longname') or q.get('shortname')
+                if not fallback.get('exchange'):
+                    fallback['exchange']  = q.get('exchange')
+                if not fallback.get('sector'):
+                    fallback['sector']    = q.get('sector')
+                if not fallback.get('industry'):
+                    fallback['industry']  = q.get('industry')
+                # typeDisp gives us "Equity", "ETF" etc
+                fallback['quoteType']     = q.get('quoteType', '')
+        except Exception:
+            pass
+
+        # Merge with any partial info already fetched, remove None values
+        if info and isinstance(info, dict):
+            fallback.update({k: v for k, v in info.items() if v is not None})
+        info = {k: v for k, v in fallback.items() if v is not None}
 
     # ── Fetch remaining data with stagger
     time.sleep(0.5)
@@ -1587,10 +1653,10 @@ def main():
     targets = calc_targets(info, m, dcf)
 
     _i       = info if (info and isinstance(info, dict)) else {}
-    company  = _i.get('longName', ticker)
-    sector   = _i.get('sector', 'Unknown')
-    industry = _i.get('industry', 'Unknown')
-    country  = _i.get('country', '')
+    company  = _i.get('longName') or _i.get('shortName') or ticker
+    sector   = _i.get('sector')   or ''
+    industry = _i.get('industry') or ''
+    country  = _i.get('country')  or ''
     mktcap   = safe_get(info, 'marketCap')
     wk52_h   = m.get('52w_high')
     wk52_l   = m.get('52w_low')
@@ -1611,9 +1677,10 @@ def main():
             {"<span style='font-size:14px;color:#5a7a9a;margin-left:8px;'>"+ch_str+"</span>" if ch_str else ""}
         </div>
         <div class="hf-meta">
-            <span>{sector}</span> · <span>{industry}</span>
-            {"· <span>"+country+"</span>" if country else ""}
-            · Mkt Cap <span>{fmt_cap(mktcap,SYM)}</span>
+            {f'<span>{sector}</span> &middot; ' if sector else ''}
+            {f'<span>{industry}</span> &middot; ' if industry else ''}
+            {f'<span>{country}</span> &middot; ' if country else ''}
+            Mkt Cap <span>{fmt_cap(mktcap,SYM)}</span>
         </div>
     </div>
     """, unsafe_allow_html=True)
