@@ -1525,7 +1525,7 @@ def main():
         st.markdown(
             '<div class="hf-hero">'
             '<div class="hf-logo">&#9889; H-Factor &middot; Fundamental Analysis Agent</div>'
-            '<div class="hf-company-name">Know What Any<br/>Stock Is Worth.</div>'
+            '<div class="hf-company-name">Know What Any Stock Is Worth.</div>'
             '<div class="hf-meta">'
             'Multi-model valuation engine &middot; DCF &middot; Ratio Scoring &middot; Analyst Consensus &middot; '
             '<span>40+ currencies</span> &middot; Free data via Yahoo Finance'
